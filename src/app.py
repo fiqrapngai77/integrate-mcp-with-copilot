@@ -5,11 +5,18 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from datetime import timedelta
+
+import auth
+
+# OAuth2 scheme for dependency
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -77,6 +84,41 @@ activities = {
     }
 }
 
+# In-memory users store for now: {email: {hashed_password, role}}
+users = {}
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = auth.decode_access_token(token)
+        email = payload.get("sub")
+        if email is None or email not in users:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return {"email": email, "role": users[email].get("role", "parent")}
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
+
+@app.post('/auth/register')
+def register(email: str, password: str):
+    if email in users:
+        raise HTTPException(status_code=400, detail="User already exists")
+    hashed = auth.get_password_hash(password)
+    users[email] = {"hashed_password": hashed, "role": "parent"}
+    return {"message": "User registered"}
+
+
+@app.post('/auth/login')
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    email = form_data.username
+    password = form_data.password
+    user = users.get(email)
+    if not user or not auth.verify_password(password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(data={"sub": email}, expires_delta=access_token_expires)
+    return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.get("/")
 def root():
@@ -89,7 +131,7 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -97,6 +139,10 @@ def signup_for_activity(activity_name: str, email: str):
 
     # Get the specific activity
     activity = activities[activity_name]
+
+    # Ensure the caller is the same user
+    if email != current_user["email"]:
+        raise HTTPException(status_code=403, detail="Cannot sign up other users")
 
     # Validate student is not already signed up
     if email in activity["participants"]:
@@ -111,7 +157,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -119,6 +165,10 @@ def unregister_from_activity(activity_name: str, email: str):
 
     # Get the specific activity
     activity = activities[activity_name]
+
+    # Ensure the caller is the same user
+    if email != current_user["email"]:
+        raise HTTPException(status_code=403, detail="Cannot unregister other users")
 
     # Validate student is signed up
     if email not in activity["participants"]:
